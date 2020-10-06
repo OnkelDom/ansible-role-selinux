@@ -1,0 +1,174 @@
+---
+- name: install python2 tools
+  package:
+    name: "{{ item }}"
+    state: present
+  environment: "{{proxy_env}}"
+  when: "ansible_python_version is version('3', '<')"
+  with_items:
+    - libselinux-python
+    - policycoreutils-python
+  become: true
+  tags: selinux
+
+- name: install python3 tools
+  package:
+    name: "{{ item }}"
+    state: present
+  environment: "{{proxy_env}}"
+  when: "ansible_python_version is version('3', '>=')"
+  with_items:
+    - python3-libselinux
+    - python3-policycoreutils
+  become: true
+  tags: selinux
+
+- name: refresh facts
+  setup:
+    filter: ansible_selinux
+  become: true
+  tags: selinux
+
+- name: install tool semanage
+  package:
+    name:
+      - policycoreutils-python-utils
+    state: present
+  environment: "{{proxy_env}}"
+  when: ansible_distribution_major_version > "7" and ansible_os_family == "RedHat"
+  become: true
+  tags: selinux
+
+- name: set permanent state if enabled
+  selinux:
+    state: "{{ selinux_state | default(ansible_selinux.config_mode, true) }}"
+    policy: "{{ selinux_policy | default(ansible_selinux.type, true) }}"
+  register: selinux_mod_output_enabled
+  when: ansible_selinux.status == "enabled" and ( selinux_state or selinux_policy )
+  become: true
+  tags: selinux
+
+- name: set permanent state if disabled
+  selinux:
+    state: "{{ selinux_state }}"
+    policy: "{{ selinux_policy | default('targeted', true) }}"
+  register: selinux_mod_output_disabled
+  when: ansible_selinux.status == "disabled" and selinux_state
+  become: true
+  tags: selinux
+
+- name: Set ansible facts if needed
+  set_fact:
+    selinux_reboot_required: "{{ selinux_mod_output_enabled.reboot_required
+      if ( selinux_mod_output_enabled.reboot_required is defined ) else (
+      selinux_mod_output_disabled.reboot_required | default(false) ) }}"
+  become: true
+  tags: selinux
+
+- name: fail if reboot is required
+  fail:
+    msg: "Reboot is required to apply changes. Re-execute the role after boot."
+  when: selinux_reboot_required
+
+- debug:
+    msg: "SELinux is disabled on system - some SELinux modules can crash"
+  when: ansible_selinux.status == "disabled"
+  become: true
+  tags: selinux
+
+- name: drop all local modifications
+  command: /usr/sbin/semanage -i -
+  args:
+    stdin: "{{ drop_local_modifications }}"
+  when: selinux_all_purge | bool
+  become: true
+  tags: selinux
+
+- name: purge all boolean local modifications
+  command: /usr/sbin/semanage boolean -D
+  when: selinux_booleans_purge | bool
+  become: true
+  tags: selinux
+
+- name: purge all file context local modifications
+  command: /usr/sbin/semanage fcontext -D
+  when: selinux_fcontexts_purge | bool
+  become: true
+  tags: selinux
+
+- name: purge all port local modifications
+  command: /usr/sbin/semanage port -D
+  when: selinux_ports_purge | bool
+  become: true
+  tags: selinux
+
+- name: purge all login local modifications
+  command: /usr/sbin/semanage login -D
+  when: selinux_logins_purge | bool
+  become: true
+  tags: selinux
+
+- name: reload policy
+  command: semodule -R
+  when: ansible_selinux.status != "disabled"
+  become: true
+  tags: selinux
+
+- name: set booleans
+  seboolean:
+    name: "{{ item.name }}"
+    state: "{{ item.state }}"
+    persistent: "{{ item.persistent | default('no') }}"
+  with_items: "{{ selinux_booleans }}"
+  become: true
+  tags: selinux
+
+- name: set file contexts
+  sefcontext:
+    target: "{{ item.target }}"
+    setype: "{{ item.setype }}"
+    ftype: "{{ item.ftype | default('a') }}"
+    state: "{{ item.state | default('present') }}"
+    # FIXME: selevel, seuser
+  with_items: "{{ selinux_fcontexts }}"
+  become: true
+  tags: selinux
+
+- name: restore labels on filesystem tree
+  command: /sbin/restorecon -R -v {{ item }}
+  with_items: "{{ selinux_restore_dirs }}"
+  register: restorecon_cmd
+  changed_when: '"Relabeled" in restorecon_cmd.stdout'
+  become: true
+  tags: selinux
+
+- name: restore labels on filesystem tree in check mode
+  command: /sbin/restorecon -R -v -n {{ item }}
+  with_items: "{{ selinux_restore_dirs }}"
+  register: restorecon_cmd
+  changed_when: '"Would relabel" in restorecon_cmd.stdout'
+  check_mode: no
+  when: ansible_check_mode
+  become: true
+  tags: selinux
+
+- name: set an label on a port
+  seport:
+    ports: "{{ item.ports }}"
+    proto: "{{ item.proto | default('tcp') }}"
+    setype: "{{ item.setype }}"
+    state: "{{ item.state | default(present) }}"
+  with_items: "{{ selinux_ports }}"
+  become: true
+  tags: selinux
+
+- name: set linux user to user mapping
+  selogin:
+    login: "{{ item.login }}"
+    seuser: "{{ item.seuser }}"
+    serange: "{{ item.serange | default('s0') }}"
+    state: "{{ item.state | default(present) }}"
+    reload: "{{ item.reload | default(False) }}"
+  with_items: "{{ selinux_logins }}"
+  become: true
+  tags: selinux
